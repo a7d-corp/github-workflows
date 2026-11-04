@@ -1,0 +1,199 @@
+on:
+  workflow_call:
+    inputs:
+      BUILD_ARTIFACT:
+        description: Name of the build artifact to add to the package repo
+        required: true
+        type: string
+      PKGBUILD_TEMPLATE:
+        description: Path to the PKGBUILD template
+        type: string
+        default: dist/linux/arch/PKGBUILD.template
+      RELEASE_TAG:
+        description: Release tag to build the package from
+        required: true
+        type: string
+      TS_TAG:
+        description: Tailscale tag for the ephemeral node, e.g. tag:ci
+        required: true
+        type: string
+    secrets:
+      SSH_HOST:
+        required: true
+      SSH_HOST_KNOWN_HOSTS:
+        required: true
+      SSH_USER:
+        required: true
+      SSH_USER_PRIVATE_KEY:
+        required: true
+      PGP_SIGNING_KEY_CONTENT:
+        required: true
+      PGP_SIGNING_KEY_ID:
+        required: true
+      TS_OAUTH_CLIENT_ID:
+        required: true
+      TS_OAUTH_CLIENT_SECRET:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  add-package-to-database:
+    name: add-package
+    runs-on: ubuntu-latest
+    env:
+      BUILD_ARTIFACT: ${{ inputs.BUILD_ARTIFACT }}
+      PKGBUILD_TEMPLATE: ${{ inputs.PKGBUILD_TEMPLATE }}
+      RELEASE_TAG: ${{ inputs.RELEASE_TAG }}
+      PACKAGE_BUILD_USER: 2000
+
+    steps:
+      - name: Set up Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+          tags: ${{ inputs.TS_TAG }}
+
+      - name: Create temporary workdir
+        run: |
+          WORK_DIR="$(mktemp -d "${RUNNER_TEMP}/pkg.XXXXXX")"
+          mkdir -p "${WORK_DIR}/build"
+          install -d -m 700 "${WORK_DIR}/keys"
+          echo "WORK_DIR=${WORK_DIR}" >> "$GITHUB_ENV"
+          echo "BUILD_DIR=${WORK_DIR}/build" >> "$GITHUB_ENV"
+
+      - name: Download linux-amd64 asset and compute checksum
+        id: asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for i in $(seq 1 20); do
+            echo "Attempt ${i}/20: downloading ${BUILD_ARTIFACT}"
+            if gh release download "${RELEASE_TAG}" \
+                --repo "${{ github.repository }}" \
+                --pattern "${BUILD_ARTIFACT}" \
+                --dir "${BUILD_DIR}" \
+                2>/dev/null; then
+              echo "Downloaded successfully"
+              break
+            fi
+            if [ "${i}" -eq 20 ]; then
+              echo "::error::Timed out waiting for ${BUILD_ARTIFACT}"
+              exit 1
+            fi
+            echo "Asset not yet available, retrying in 30s..."
+            sleep 30
+          done
+
+          sha256=$(sha256sum "${BUILD_DIR}/${BUILD_ARTIFACT}" | awk '{print $1}')
+          echo "BUILD_ARTIFACT_SHA256=${sha256}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check out PKGBUILD template
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: ${{ env.PKGBUILD_TEMPLATE }}
+          sparse-checkout-cone-mode: false
+
+      - name: Render PKGBUILD
+        env:
+          BUILD_ARTIFACT_SHA256: ${{ steps.asset.outputs.BUILD_ARTIFACT_SHA256 }}
+        run: |
+          export PKG_VER="${RELEASE_TAG#v}"
+
+          # substitute in package version (derived from release tag) and artifact sha256sum
+          envsubst '${PKG_VER} ${BUILD_ARTIFACT_SHA256}' < "${PKGBUILD_TEMPLATE}" > "${BUILD_DIR}/PKGBUILD"
+
+      - name: Show PKGBUILD
+        run: |
+          echo "::group::PKGBUILD"
+          cat "${BUILD_DIR}/PKGBUILD"
+          echo "::endgroup::"
+          ls -la "${BUILD_DIR}"
+          {
+            echo '### Rendered PKGBUILD'
+            echo '```bash'
+            cat "${BUILD_DIR}/PKGBUILD"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stage signing key
+        env:
+          PGP_SIGNING_KEY_CONTENT: ${{ secrets.PGP_SIGNING_KEY_CONTENT }}
+        run: |
+          umask 077
+          printf '%s\n' "${PGP_SIGNING_KEY_CONTENT}" > "${WORK_DIR}/keys/signing.asc"
+          sudo chown "${PACKAGE_BUILD_USER}" "${WORK_DIR}/keys/signing.asc"
+
+      - name: Build package in Arch container
+        env:
+          PGP_SIGNING_KEY_ID: ${{ secrets.PGP_SIGNING_KEY_ID }}
+        run: |
+          cat > "${WORK_DIR}/build.sh" <<'BUILD'
+          #!/usr/bin/env bash
+          set -x # TODO
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed pacman-contrib
+          # makepkg cannot run as root
+          useradd --create-home --uid "${PACKAGE_BUILD_USER}" builder
+          echo 'builder ALL=(ALL) NOPASSWD: /usr/bin/pacman' > /etc/sudoers.d/builder
+          chown -R builder: /build
+          sudo -u builder --preserve-env=PGP_SIGNING_KEY_ID bash -euo pipefail <<'EOS'
+          gpg --batch --quiet --import /keys/signing.asc
+          cd /build
+          makepkg --syncdeps --noconfirm --clean --sign --key "${PGP_SIGNING_KEY_ID}"
+          EOS
+          # hand files back to the runner user
+          chown -R "${HOST_UID}:${HOST_GID}" /build
+          BUILD
+
+          docker run --rm --pull=always \
+            -v "${BUILD_DIR}:/build" \
+            -v "${WORK_DIR}/keys/signing.asc:/keys/signing.asc:ro" \
+            -v "${WORK_DIR}/build.sh:/build.sh:ro" \
+            -e PGP_SIGNING_KEY_ID \
+            -e PACKAGE_BUILD_USER \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            archlinux:base-devel \
+            bash /build.sh
+
+          # create a variable which holds all package names
+          cd "$WORK_DIR/build"
+          ls -l *.pkg.tar.zst*
+          echo "PKG_FILES=$(ls *.pkg.tar.zst | tr '\n' ' ')" >> "$GITHUB_ENV"
+
+      - name: Configure SSH
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_KEY: ${{ secrets.SSH_USER_PRIVATE_KEY }}
+          KNOWN_HOSTS: ${{ secrets.SSH_HOST_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${SSH_KEY}" > ~/.ssh/id_archrepo
+          chmod 600 ~/.ssh/id_archrepo
+          printf '%s\n' "${KNOWN_HOSTS}" >> ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<EOF
+          Host ${SSH_HOST}
+            User ${SSH_USER}
+            IdentityFile ~/.ssh/id_archrepo
+            IdentitiesOnly yes
+          EOF
+
+      - name: Sync package files to repo host
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          set -x # TODO
+          cd "${WORK_DIR}/build"
+          ls
+          files=()
+          for f in ${PKG_FILES}; do files+=("$f" "$f.sig"); done
+          rsync -av --chmod=F644 "${files[@]}" "${SSH_HOST}:/"
+
+      - name: Add packages to repo
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          GPG_SIGNING_KEY: ${{ secrets.PGP_SIGNING_KEY_CONTENT }}
+        run: printf '%s\n' "${GPG_SIGNING_KEY}" | ssh "${SSH_HOST}" repo-add ${PKG_FILES}
