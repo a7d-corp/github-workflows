@@ -142,7 +142,7 @@ jobs:
           sudo -u builder --preserve-env=PGP_SIGNING_KEY_ID bash -euo pipefail <<'EOS'
           gpg --batch --quiet --import /keys/signing.asc
           cd /build
-          makepkg --syncdeps --noconfirm --clean --sign --key "${PGP_SIGNING_KEY_ID}"
+          PACKAGER="Simon Weald <arch-packages@simonweald.com>" makepkg --syncdeps --noconfirm --clean --sign --key "${PGP_SIGNING_KEY_ID}"
           EOS
           # hand files back to the runner user
           chown -R "${HOST_UID}:${HOST_GID}" /build
