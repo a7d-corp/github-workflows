@@ -1,8 +1,8 @@
 on:
   workflow_call:
     inputs:
-      BUILD_ARTIFACT:
-        description: Name of the build artifact to add to the package repo
+      BUILD_ARTIFACT_PATTERN:
+        description: Pattern matching the name of the build artifact to add to the package repo
         required: true
         type: string
       PKGBUILD_TEMPLATE:
@@ -43,7 +43,7 @@ jobs:
     name: add-package
     runs-on: ubuntu-latest
     env:
-      BUILD_ARTIFACT: ${{ inputs.BUILD_ARTIFACT }}
+      BUILD_ARTIFACT_PATTERN: ${{ inputs.BUILD_ARTIFACT_PATTERN }}
       PKGBUILD_TEMPLATE: ${{ inputs.PKGBUILD_TEMPLATE }}
       RELEASE_TAG: ${{ inputs.RELEASE_TAG }}
       PACKAGE_BUILD_USER: 2000
@@ -69,11 +69,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # assemble the artifact name for the required tag
+          export BUILD_ARTIFACT=$(sed 's/\*/'"${RELEASE_TAG}"'/g' <<< ${BUILD_ARTIFACT_PATTERN})
+
           for i in $(seq 1 20); do
             echo "Attempt ${i}/20: downloading ${BUILD_ARTIFACT}"
             if gh release download "${RELEASE_TAG}" \
                 --repo "${{ github.repository }}" \
-                --pattern "${BUILD_ARTIFACT}" \
+                --pattern "${BUILD_ARTIFACT_PATTERN}" \
                 --dir "${BUILD_DIR}" \
                 2>/dev/null; then
               echo "Downloaded successfully"
@@ -87,7 +90,10 @@ jobs:
             sleep 30
           done
 
+          # calculate the sha256sum for the artifact
           sha256=$(sha256sum "${BUILD_DIR}/${BUILD_ARTIFACT}" | awk '{print $1}')
+
+          # make the sha256sum available to later steps
           echo "BUILD_ARTIFACT_SHA256=${sha256}" >> "${GITHUB_OUTPUT}"
 
       - name: Check out PKGBUILD template
